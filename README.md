@@ -9,6 +9,8 @@ IDWarp uses an inverse distance method to modify the location of mesh volume nod
 ## Documentation
 Please see the [documentation](https://mdolab-idwarp.readthedocs-hosted.com/en/latest/) for installation details and API documentation.
 
+This branch also includes a local SU2 usage note: [SU2_USAGE.md](SU2_USAGE.md).
+
 To locally build the documentation, enter the `doc` folder and enter `make html` in terminal.
 You can then view the built documentation in the `_build` folder.
 
