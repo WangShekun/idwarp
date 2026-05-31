@@ -1,6 +1,8 @@
 # IDWarp SU2 Usage Guide
 
-This branch adds native `fileType="SU2"` support to IDWarp. SU2 ASCII meshes can be read, warped, and written back through `USMesh` without a separate `SU2USMesh` subclass.
+This branch is based on the original IDWarp project and adds native `fileType="SU2"` support on top of the existing mesh-warping workflow. SU2 ASCII meshes can be read, warped, and written back through `USMesh` without a separate `SU2USMesh` subclass.
+
+The intent of this document is to describe the added SU2 workflow while keeping the original IDWarp interfaces and usage pattern as intact as possible.
 
 ## Scope
 

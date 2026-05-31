@@ -6,6 +6,8 @@
 
 IDWarp uses an inverse distance method to modify the location of mesh volume nodes given a perturbation of the surface nodes.
 
+This branch is based on the original `mdolab/idwarp` codebase and adds SU2 mesh support while preserving the standard IDWarp workflow.
+
 ## Documentation
 Please see the [documentation](https://mdolab-idwarp.readthedocs-hosted.com/en/latest/) for installation details and API documentation.
 
