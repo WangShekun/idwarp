@@ -107,6 +107,7 @@ class USMesh(BaseSolver):
 
         # Initialize various bits of stored information
         self.OFData = {}
+        self.SU2Data = {}
         self.warpInitialized = False
         self.faceSizes = None
         self.fileType = self.getOption("fileType")
@@ -120,12 +121,16 @@ class USMesh(BaseSolver):
             self._readOFGrid(fileName)
         elif self.fileType == "PLOT3D":
             self.warp.readplot3d(fileName)
+        elif self.fileType == "SU2":
+            self._readSU2Grid(fileName)
 
     @staticmethod
     def _getDefaultOptions():
         defOpts = {
             "gridFile": [(str, type(None)), None],
-            "fileType": [str, ["CGNS", "OpenFOAM", "PLOT3D"]],
+            "fileType": [str, ["CGNS", "OpenFOAM", "PLOT3D", "SU2"]],
+            "su2ReadMode": [str, ["auto", "fast", "robust"]],
+            "su2RestartFile": [(str, type(None)), None],
             "specifiedSurfaces": [(list, type(None)), None],
             "symmetrySurfaces": [(list, type(None)), None],
             "symmetryPlanes": [(list, type(None)), None],
@@ -510,6 +515,9 @@ class USMesh(BaseSolver):
             ofm = PYOFM(comm=self.comm)
             ofm.writeVolumeMeshPoints(self.getCommonGrid())
 
+        elif self.fileType == "SU2":
+            self._writeSU2Grid(fileName)
+
     def writeOFGridTecplot(self, fileName):
         """
         Write the current OpenFOAM grid to a Tecplot FE polyhedron file.
@@ -749,6 +757,12 @@ class USMesh(BaseSolver):
             # Run the "external" command
             self.setSurfaceDefinition(pts=pts, conn=conn, faceSizes=faceSizes)
 
+        elif self.fileType == "SU2":
+            faceSizes, conn, pts = self._computeSU2Conn()
+
+            # Run the "external" command
+            self.setSurfaceDefinition(pts=pts, conn=conn, faceSizes=faceSizes)
+
     def _setSymmetryConditions(self):
         """This function determines the symmetry planes used for the
         computation. It has a similar structure to setInternalSurface.
@@ -869,6 +883,18 @@ class USMesh(BaseSolver):
                             "The families not found are %s." % (repr(missing)),
                             stacklevel=2,
                         )
+
+            elif self.fileType == "SU2":
+                if self.getOption("symmetrySurfaces") is None:
+                    raise Error(
+                        "For SU2 meshes symmetry must be specified either with "
+                        "the 'symmetryPlanes' option (explicit point-normal) or "
+                        "the 'symmetrySurfaces' option (a list of SU2 "
+                        "MARKER_TAG names). Automatic detection is unavailable "
+                        "because SU2 markers carry no boundary-condition type."
+                    )
+                if self.comm.rank == 0:
+                    planes = self._computeSU2SymmPlanes()
 
             elif self.fileType in ["OpenFOAM", "PLOT3D"]:
                 # We could probably implement this at some point, but
@@ -1043,6 +1069,273 @@ class USMesh(BaseSolver):
         self.warp.createcommongrid(x0.T)
 
         ofm = None
+
+    # =========================================================================
+    #                  Local SU2 Functions
+    # =========================================================================
+
+    def _readSU2Grid(self, meshFile):
+        """Read a SU2 ASCII mesh and create the internal volume mesh.
+
+        The volume nodes are partitioned across the communicator using the
+        same contiguous-slice strategy as IDWarp's native CGNS/PLOT3D
+        readers: the root reads the file once and scatters contiguous blocks
+        of nodes so each rank calls ``createCommonGrid`` with only its local
+        nodes. The full SU2 metadata (markers, original node count and the
+        partition descriptors) is retained on the root for surface extraction
+        and writing.
+
+        Parameters
+        ----------
+        meshFile : str
+            Path to the SU2 ASCII mesh file.
+        """
+        from .su2io import read_su2_points_and_markers
+
+        comm = self.comm
+        rank = comm.rank
+        size = comm.size
+
+        if rank == 0:
+            ndime, pts, markers = read_su2_points_and_markers(meshFile, mode=self.getOption("su2ReadMode"))
+            nNodes = int(pts.shape[0])
+        else:
+            ndime, pts, markers = None, None, None
+            nNodes = None
+
+        ndime = comm.bcast(ndime, root=0)
+        nNodes = comm.bcast(nNodes, root=0)
+
+        starts = [int(nNodes * i / size) for i in range(size + 1)]
+        countsNodes = [starts[i + 1] - starts[i] for i in range(size)]
+        counts3 = [3 * c for c in countsNodes]
+        displs3 = [3 * d for d in starts[:-1]]
+
+        recv = np.empty(counts3[rank], dtype=float)
+        send = np.asarray(pts, dtype=float).ravel(order="C") if rank == 0 else None
+        comm.Scatterv([send, counts3, displs3, MPI.DOUBLE], recv, root=0)
+        localPts = recv.reshape((-1, 3))
+
+        self.warp.createcommongrid(np.asfortranarray(localPts.T))
+
+        self.SU2Data = {
+            "path": meshFile,
+            "ndime": ndime,
+            "nNodes": nNodes,
+            "counts3": counts3,
+            "displs3": displs3,
+        }
+        if rank == 0:
+            self.SU2Data["pts0"] = pts
+            self.SU2Data["markers"] = markers
+
+    def _computeSU2Conn(self):
+        """Build the warping surface from the SU2 boundary markers.
+
+        Only the root processor builds the surface; the other ranks return
+        empty arrays and ``setSurfaceDefinition`` performs the allgather. The
+        markers used are those listed in the ``specifiedSurfaces`` option, or
+        all markers if the option is ``None``. Both 2D (line) and 3D
+        (triangle/quad) boundary elements are supported.
+
+        Returns
+        -------
+        faceSizes : numpy.ndarray (intc)
+        faceConn : numpy.ndarray (intc)
+        pts : numpy.ndarray (float), shape (N, 3)
+        """
+        from .su2io import VTK_NNODES
+
+        empty = (
+            np.zeros(0, dtype="intc"),
+            np.zeros(0, dtype="intc"),
+            np.zeros((0, 3), dtype=float),
+        )
+
+        if self.comm.rank != 0:
+            return empty
+
+        pts0 = self.SU2Data["pts0"]
+        markers = self.SU2Data["markers"]
+
+        want = self.getOption("specifiedSurfaces")
+        wantSet = None if want is None else set(s.strip().lower() for s in want)
+
+        faces = []
+        faceSizes = []
+        usedNodes = set()
+
+        for tag in sorted(markers.keys(), key=lambda x: x.lower()):
+            if wantSet is not None and tag.strip().lower() not in wantSet:
+                continue
+            for e in markers[tag]:
+                etype = e[0]
+                if etype not in VTK_NNODES:
+                    continue
+                nn = VTK_NNODES[etype]
+                connG = e[1 : 1 + nn]
+                faces.append(connG)
+                faceSizes.append(nn)
+                usedNodes.update(connG)
+
+        if not faces:
+            return empty
+
+        usedNodes = sorted(usedNodes)
+        old2new = {old: i for i, old in enumerate(usedNodes)}
+        surfPts = pts0[usedNodes, :]
+
+        connFlat = []
+        for f in faces:
+            connFlat.extend(old2new[n] for n in f)
+
+        faceSizesArr = np.ascontiguousarray(np.array(faceSizes, dtype="intc"))
+        connArr = np.ascontiguousarray(np.array(connFlat, dtype="intc"))
+        surfPtsArr = np.ascontiguousarray(np.array(surfPts, dtype=float))
+
+        return faceSizesArr, connArr, surfPtsArr
+
+    def _computeSU2SymmPlanes(self):
+        """Derive symmetry planes from the SU2 markers named in
+        ``symmetrySurfaces`` (root only).
+
+        Each requested marker is reduced to a single ``[point, normal]`` plane
+        using the same area-averaged normal routine the CGNS path uses. The
+        returned planes are de-duplicated downstream by the shared plane
+        reduction in ``_setSymmetryConditions``.
+
+        Returns
+        -------
+        list[list[numpy.ndarray]]
+            A list of ``[point(3,), normal(3,)]`` entries, one per marker.
+        """
+        from .su2io import VTK_NNODES
+
+        want = self.getOption("symmetrySurfaces")
+        wantSet = set(s.strip().lower() for s in want)
+
+        pts0 = self.SU2Data["pts0"]
+        markers = self.SU2Data["markers"]
+
+        planes = []
+        usedFams = set()
+        for tag in sorted(markers.keys(), key=lambda x: x.lower()):
+            if tag.strip().lower() not in wantSet:
+                continue
+
+            faces = []
+            faceSizes = []
+            usedNodes = set()
+            for e in markers[tag]:
+                etype = e[0]
+                if etype not in VTK_NNODES:
+                    continue
+                nn = VTK_NNODES[etype]
+                connG = e[1 : 1 + nn]
+                faces.append(connG)
+                faceSizes.append(nn)
+                usedNodes.update(connG)
+
+            if not faces:
+                continue
+
+            usedNodes = sorted(usedNodes)
+            old2new = {old: i for i, old in enumerate(usedNodes)}
+            surfPts = np.ascontiguousarray(pts0[usedNodes, :], dtype=float)
+
+            connFlat = []
+            for f in faces:
+                connFlat.extend(old2new[n] + 1 for n in f)
+
+            ptsFlat = np.ascontiguousarray(surfPts.ravel(), dtype=float)
+            connArr = np.ascontiguousarray(np.array(connFlat, dtype="intc"))
+            sizesArr = np.ascontiguousarray(np.array(faceSizes, dtype="intc"))
+
+            avgNorm = np.array(self.warp.averagenormal(ptsFlat, connArr, sizesArr))
+            planes.append([surfPts[0].copy(), avgNorm])
+            usedFams.add(tag.strip().lower())
+
+        missing = wantSet - usedFams
+        if missing:
+            warnings.warn(
+                "Not all symmetrySurfaces markers were found in the SU2 mesh. "
+                "Missing: %s" % repr(sorted(missing)),
+                stacklevel=2,
+            )
+        return planes
+
+    def _gatherSU2Points(self):
+        """Gather the deformed volume nodes onto the root in SU2 ordering.
+
+        Returns
+        -------
+        numpy.ndarray, shape (nNodes, 3) on the root, ``None`` elsewhere.
+        """
+        comm = self.comm
+        local = np.asarray(self.getCommonGrid(), dtype=float)
+
+        if comm.rank == 0:
+            globalBuf = np.empty(3 * self.SU2Data["nNodes"], dtype=float)
+        else:
+            globalBuf = None
+
+        comm.Gatherv(
+            local,
+            [globalBuf, self.SU2Data["counts3"], self.SU2Data["displs3"], MPI.DOUBLE],
+            root=0,
+        )
+
+        if comm.rank != 0:
+            return None
+        return np.asarray(globalBuf).reshape((-1, 3))
+
+    def _writeSU2Grid(self, fileName=None):
+        """Write the deformed mesh to a SU2 ASCII file (root only).
+
+        Parameters
+        ----------
+        fileName : str or None
+            Output path. If ``None``, ``<input>_deformed.su2`` is used.
+        """
+        from .su2io import stream_write_su2_with_new_points
+
+        newPts = self._gatherSU2Points()
+        if newPts is None:
+            return
+
+        if fileName is None:
+            base = os.path.splitext(os.path.basename(self.SU2Data["path"]))[0]
+            fileName = base + "_deformed.su2"
+
+        ndime = int(self.SU2Data["ndime"])
+        stream_write_su2_with_new_points(self.SU2Data["path"], fileName, ndime, newPts)
+
+    def writeSU2Restart(self, restartOut):
+        """Update a SU2 ASCII restart/solution file with the deformed coordinates.
+
+        The input restart file is taken from the ``su2RestartFile`` option. The
+        x/y(/z) columns are overwritten with the deformed node coordinates; all
+        field values stay attached to their PointID (no interpolation). This is
+        a convenience utility separate from ``writeGrid`` and only writes on the
+        root processor.
+
+        Parameters
+        ----------
+        restartOut : str
+            Output path for the updated restart/solution file.
+        """
+        from .su2io import update_su2_restart
+
+        restartIn = self.getOption("su2RestartFile")
+        if restartIn is None:
+            raise Error("writeSU2Restart requires the 'su2RestartFile' option to be set.")
+
+        newPts = self._gatherSU2Points()
+        if newPts is None:
+            return
+
+        ndime = int(self.SU2Data["ndime"])
+        update_su2_restart(restartIn, restartOut, ndime, newPts)
 
     # =========================================================================
     #                     Utility functions
