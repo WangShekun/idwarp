@@ -18,8 +18,8 @@ subroutine initializeWarping(pts, uniquePts, link, faceSizes, faceConn, &
     ! Working
     integer(kind=intType) :: nNodesTotal, ierr, iStart, iEnd, iProc
     integer(kind=intType) :: i, j, ii, kk
-    real(kind=realType), dimension(:), allocatable :: costs, procEndCosts, cumNodesProc
-    integer(kind=intType), dimension(:), allocatable :: procSplits, procSplitsLocal
+    real(kind=realType), dimension(:), allocatable :: costs, procEndCosts
+    integer(kind=intType), dimension(:), allocatable :: cumNodesProc, procSplits, procSplitsLocal
     real(kind=realType), dimension(:), allocatable :: denominator0Copy
     real(kind=realtype) :: costOffset, totalCost, averageCost, c, tmp, r(3)
     integer(kind=intType) :: nVol, curBin, newBin, newDOFProc, totalDOF
